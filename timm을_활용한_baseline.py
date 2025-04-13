@@ -152,44 +152,43 @@ def validate_one_epoch(model, loader, criterion, device):
     accuracy = correct / total
     return epoch_loss, accuracy
 
-best_loss = float('inf')
-best_model = None
+if __name__ == '__main__':
+    best_loss = float('inf')
+    best_model = None
 
-for epoch in range(N_EPOCHS):
-    print(f"\nEpoch [{epoch+1}/{N_EPOCHS}]")
+    for epoch in range(N_EPOCHS):
+        print(f"\nEpoch [{epoch+1}/{N_EPOCHS}]")
 
-    # Train
-    train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
+        # Train
+        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
 
-    # Validate
-    val_loss, val_acc = validate_one_epoch(model, valid_loader, criterion, device)
+        # Validate
+        val_loss, val_acc = validate_one_epoch(model, valid_loader, criterion, device)
 
-    print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Accuracy: {val_acc*100:.2f}%")
+        print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Accuracy: {val_acc*100:.2f}%")
 
-    # Check for best model
-    if val_loss < best_loss:
-        best_loss = val_loss
-        best_model = model
+        # Check for best model
+        if val_loss < best_loss:
+            best_loss = val_loss
+            best_model = model
 
-    scheduler.step()
+        scheduler.step()
 
-"""# Inference"""
+    # Inference
+    best_model.eval()
+    preds = []
 
-best_model.eval()
-preds = []
+    with torch.no_grad():
+        for images in tqdm(test_loader, desc="Inference", leave=False):
+            images = images.to(device)
+            outputs = best_model(images)
+            _, predicted = torch.max(outputs.data, 1)
+            preds.extend(predicted.cpu().numpy())
 
-with torch.no_grad():
-    for images in tqdm(test_loader, desc="Inference", leave=False):
-        images = images.to(device)
-        outputs = best_model(images)
-        _, predicted = torch.max(outputs.data, 1)
-        preds.extend(predicted.cpu().numpy())
+    # Decode predictions
+    pred_labels = encoder.inverse_transform(preds)
 
-# Decode predictions
-pred_labels = encoder.inverse_transform(preds)
-
-"""# Submission"""
-
-submission = pd.read_csv('./data/sample_submission.csv')
-submission['label'] = pred_labels
-submission.to_csv('baseline_submission.csv', index=False)
+    # Submission
+    submission = pd.read_csv('./data/sample_submission.csv')
+    submission['label'] = pred_labels
+    submission.to_csv('baseline_submission.csv', index=False)
