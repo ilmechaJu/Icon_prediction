@@ -101,88 +101,141 @@ test_loader = DataLoader(test_dataset, shuffle=False, **loader_params)
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-model = timm.create_model(
-    model_name="tf_efficientnet_b0.ns_jft_in1k",
-    pretrained=False,
-    num_classes=10,
-    in_chans=1
-).to(device)
+# 앙상블을 위한 여러 모델 정의
+models = {
+    'efficientnet_b0': timm.create_model(
+        model_name="tf_efficientnet_b0.ns_jft_in1k",
+        pretrained=False,
+        num_classes=10,
+        in_chans=1
+    ).to(device),
+    'efficientnet_b4': timm.create_model(
+        model_name="tf_efficientnet_b4.ns_jft_in1k",
+        pretrained=False,
+        num_classes=10,
+        in_chans=1
+    ).to(device),
+    'resnet50': timm.create_model(
+        model_name="resnet50.a1_in1k",
+        pretrained=False,
+        num_classes=10,
+        in_chans=1
+    ).to(device)
+}
+
+# 각 모델별 옵티마이저와 스케줄러 설정
+optimizers = {name: optim.AdamW(model.parameters(), lr=LR) for name, model in models.items()}
+schedulers = {name: optim.lr_scheduler.CosineAnnealingLR(opt, T_max=N_EPOCHS) 
+             for name, opt in optimizers.items()}
 
 criterion = nn.CrossEntropyLoss()
-optimizer = optim.AdamW(model.parameters(), lr=LR)
-scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=N_EPOCHS)
 
 """# Training Loop"""
 
-def train_one_epoch(model, loader, criterion, optimizer, device):
-    model.train()
+def train_one_epoch(models, loader, criterion, optimizers, device):
+    for model in models.values():
+        model.train()
+    
     running_loss = 0.0
+    total_batches = 0
 
     for images, labels in tqdm(loader, desc="Training", leave=False):
         images, labels = images.to(device), labels.to(device)
-        optimizer.zero_grad()
-        outputs = model(images)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
+        
+        # 각 모델별로 학습
+        for name, model in models.items():
+            optimizers[name].zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizers[name].step()
+            running_loss += loss.item()
+        
+        total_batches += 1
 
-        running_loss += loss.item() * images.size(0)
-
-    epoch_loss = running_loss / len(loader.dataset)
+    epoch_loss = running_loss / (total_batches * len(models))
     return epoch_loss
 
-def validate_one_epoch(model, loader, criterion, device):
-    model.eval()
+def validate_one_epoch(models, loader, criterion, device):
+    for model in models.values():
+        model.eval()
+    
     running_loss = 0.0
-    correct, total = 0, 0
+    all_predictions = []
+    all_labels = []
+    total_batches = 0
 
     with torch.no_grad():
         for images, labels in tqdm(loader, desc="Validation", leave=False):
             images, labels = images.to(device), labels.to(device)
-            outputs = model(images)
-            loss = criterion(outputs, labels)
+            
+            # 각 모델의 예측을 저장
+            model_predictions = []
+            for model in models.values():
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+                running_loss += loss.item()
+                model_predictions.append(outputs)
+            
+            # 앙상블 예측 (평균)
+            ensemble_outputs = torch.stack(model_predictions).mean(0)
+            _, predicted = torch.max(ensemble_outputs.data, 1)
+            
+            all_predictions.extend(predicted.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            total_batches += 1
 
-            running_loss += loss.item() * images.size(0)
-
-            _, predicted = torch.max(outputs.data, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
-
-    epoch_loss = running_loss / len(loader.dataset)
-    accuracy = correct / total
+    epoch_loss = running_loss / (total_batches * len(models))
+    accuracy = np.mean(np.array(all_predictions) == np.array(all_labels))
     return epoch_loss, accuracy
 
 if __name__ == '__main__':
     best_loss = float('inf')
-    best_model = None
+    best_models = None
 
     for epoch in range(N_EPOCHS):
         print(f"\nEpoch [{epoch+1}/{N_EPOCHS}]")
 
         # Train
-        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
+        train_loss = train_one_epoch(models, train_loader, criterion, optimizers, device)
 
         # Validate
-        val_loss, val_acc = validate_one_epoch(model, valid_loader, criterion, device)
+        val_loss, val_acc = validate_one_epoch(models, valid_loader, criterion, device)
 
         print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Accuracy: {val_acc*100:.2f}%")
 
-        # Check for best model
+        # Check for best models
         if val_loss < best_loss:
             best_loss = val_loss
-            best_model = model
+            best_models = {name: model.state_dict() for name, model in models.items()}
 
-        scheduler.step()
+        # Update schedulers
+        for scheduler in schedulers.values():
+            scheduler.step()
+
+    # Load best models
+    for name, state_dict in best_models.items():
+        models[name].load_state_dict(state_dict)
 
     # Inference
-    best_model.eval()
+    for model in models.values():
+        model.eval()
+    
     preds = []
 
     with torch.no_grad():
         for images in tqdm(test_loader, desc="Inference", leave=False):
             images = images.to(device)
-            outputs = best_model(images)
-            _, predicted = torch.max(outputs.data, 1)
+            
+            # 각 모델의 예측을 저장
+            model_predictions = []
+            for model in models.values():
+                outputs = model(images)
+                model_predictions.append(outputs)
+            
+            # 앙상블 예측 (평균)
+            ensemble_outputs = torch.stack(model_predictions).mean(0)
+            _, predicted = torch.max(ensemble_outputs.data, 1)
             preds.extend(predicted.cpu().numpy())
 
     # Decode predictions
@@ -191,4 +244,4 @@ if __name__ == '__main__':
     # Submission
     submission = pd.read_csv('./data/sample_submission.csv')
     submission['label'] = pred_labels
-    submission.to_csv('baseline_submission.csv', index=False)
+    submission.to_csv('ensemble_submission.csv', index=False)
