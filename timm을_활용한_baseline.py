@@ -32,9 +32,10 @@ from tqdm import tqdm
 
 """# Config / Hyperparams"""
 
-N_EPOCHS = 5
-BATCH_SIZE = 8
-LR = 5e-5
+N_EPOCHS = 10
+BATCH_SIZE = 16
+BASE_LR = 1e-4
+MAX_LR = 1e-3
 N_FOLDS = 10
 SEED = 42
 
@@ -124,15 +125,24 @@ models = {
 }
 
 # 각 모델별 옵티마이저와 스케줄러 설정
-optimizers = {name: optim.AdamW(model.parameters(), lr=LR) for name, model in models.items()}
-schedulers = {name: optim.lr_scheduler.CosineAnnealingLR(opt, T_max=N_EPOCHS) 
-             for name, opt in optimizers.items()}
+optimizers = {name: optim.AdamW(model.parameters(), lr=BASE_LR) for name, model in models.items()}
+schedulers = {
+    name: optim.lr_scheduler.OneCycleLR(
+        opt,
+        max_lr=MAX_LR,
+        epochs=N_EPOCHS,
+        steps_per_epoch=len(train_loader),
+        pct_start=0.3,
+        div_factor=25,
+        final_div_factor=1e4
+    ) for name, opt in optimizers.items()
+}
 
 criterion = nn.CrossEntropyLoss()
 
 """# Training Loop"""
 
-def train_one_epoch(models, loader, criterion, optimizers, device):
+def train_one_epoch(models, loader, criterion, optimizers, schedulers, device):
     for model in models.values():
         model.train()
     
@@ -149,6 +159,7 @@ def train_one_epoch(models, loader, criterion, optimizers, device):
             loss = criterion(outputs, labels)
             loss.backward()
             optimizers[name].step()
+            schedulers[name].step()
             running_loss += loss.item()
         
         total_batches += 1
@@ -192,12 +203,17 @@ def validate_one_epoch(models, loader, criterion, device):
 if __name__ == '__main__':
     best_loss = float('inf')
     best_models = None
-
+    
     for epoch in range(N_EPOCHS):
         print(f"\nEpoch [{epoch+1}/{N_EPOCHS}]")
+        
+        # 현재 학습률 출력
+        for name, scheduler in schedulers.items():
+            current_lr = scheduler.get_last_lr()[0]
+            print(f"{name} Learning Rate: {current_lr:.2e}")
 
         # Train
-        train_loss = train_one_epoch(models, train_loader, criterion, optimizers, device)
+        train_loss = train_one_epoch(models, train_loader, criterion, optimizers, schedulers, device)
 
         # Validate
         val_loss, val_acc = validate_one_epoch(models, valid_loader, criterion, device)
@@ -208,10 +224,6 @@ if __name__ == '__main__':
         if val_loss < best_loss:
             best_loss = val_loss
             best_models = {name: model.state_dict() for name, model in models.items()}
-
-        # Update schedulers
-        for scheduler in schedulers.values():
-            scheduler.step()
 
     # Load best models
     for name, state_dict in best_models.items():
